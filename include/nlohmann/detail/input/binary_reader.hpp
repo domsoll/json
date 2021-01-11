@@ -2255,6 +2255,31 @@ class binary_reader
     }
 
     /*!
+    @brief get next bytes from the input
+
+    This function provides the interface to the used input adapter. It does
+    not throw in case the input reached EOF, but returns false in that case.
+
+    @param[in] container container to store the bytes
+    @param[in] length    number of bytes to get
+
+    @return bytes read, less than length if EOF is reached
+    */
+    template<typename Container>
+    size_t get(Container& container, size_t length)
+    {
+        size_t read = ia.get_data(container, length);
+        chars_read += read;
+        if(read < length)
+        {
+            // mimic behavior of single char get
+            ++chars_read;
+            current = std::char_traits<char_type>::eof();
+        }
+        return read;
+    }
+
+    /*!
     @return character read from the input after ignoring all 'N' entries
     */
     char_int_type get_ignore_noop()
@@ -2313,7 +2338,6 @@ class binary_reader
     /*!
     @brief create a string by reading characters from the input
 
-    @tparam NumberType the type of the number
     @param[in] format the current format (for diagnostics)
     @param[in] len number of characters to read
     @param[out] result string created by reading @a len bytes
@@ -2324,13 +2348,12 @@ class binary_reader
           may be too large. Usually, @ref unexpect_eof() detects the end of
           the input before we run out of string memory.
     */
-    template<typename NumberType>
     bool get_string(const input_format_t format,
-                    const NumberType len,
+                    const size_t len,
                     string_t& result)
     {
         bool success = true;
-        for (NumberType i = 0; i < len; i++)
+        for (size_t i = 0; i < len; i++)
         {
             get();
             if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "string")))
@@ -2346,7 +2369,6 @@ class binary_reader
     /*!
     @brief create a byte array by reading bytes from the input
 
-    @tparam NumberType the type of the number
     @param[in] format the current format (for diagnostics)
     @param[in] len number of bytes to read
     @param[out] result byte array created by reading @a len bytes
@@ -2357,23 +2379,16 @@ class binary_reader
           may be too large. Usually, @ref unexpect_eof() detects the end of
           the input before we run out of memory.
     */
-    template<typename NumberType>
     bool get_binary(const input_format_t format,
-                    const NumberType len,
+                    const size_t len,
                     binary_t& result)
     {
-        bool success = true;
-        for (NumberType i = 0; i < len; i++)
+        get(result, len);
+        if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "binary")))
         {
-            get();
-            if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "binary")))
-            {
-                success = false;
-                break;
-            }
-            result.push_back(static_cast<std::uint8_t>(current));
+            return false;
         }
-        return success;
+        return true;
     }
 
     /*!

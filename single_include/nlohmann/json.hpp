@@ -4772,6 +4772,23 @@ class file_input_adapter
         return std::fgetc(m_file);
     }
 
+    template<typename Container>
+    size_t get_data(Container& container, size_t length)
+    {
+        container.clear();
+        size_t done;
+        for(done = 0; done < length; ++done)
+        {
+            auto c = get_character();
+            if(c == std::char_traits<char_type>::eof())
+            {
+                break;
+            }
+            container.push_back(c);
+        }
+        return done;
+    }
+
   private:
     /// the file pointer to read from
     std::FILE* m_file;
@@ -4831,6 +4848,23 @@ class input_stream_adapter
         return res;
     }
 
+    template<typename Container>
+    size_t get_data(Container& container, size_t length)
+    {
+        container.clear();
+        size_t done;
+        for(done = 0; done < length; ++done)
+        {
+            auto c = get_character();
+            if(c == std::char_traits<char_type>::eof())
+            {
+                break;
+            }
+            container.push_back(c);
+        }
+        return done;
+    }
+
   private:
     /// the associated input stream
     std::istream* is = nullptr;
@@ -4862,6 +4896,23 @@ class iterator_input_adapter
         }
     }
 
+    template<typename Container>
+    size_t get_data(Container& container, size_t length)
+    {
+        container.clear();
+        size_t done;
+        for(done = 0; done < length; ++done)
+        {
+            auto c = get_character();
+            if(c == std::char_traits<char_type>::eof())
+            {
+                break;
+            }
+            container.push_back(c);
+        }
+        return done;
+    }
+
   private:
     IteratorType current;
     IteratorType end;
@@ -4876,6 +4927,50 @@ class iterator_input_adapter
 
 };
 
+// Input adapter for contiguous byte containers.
+// Allows batch copy to improve performance for known size elements like binary data
+template<typename IteratorType>
+class contiguous_bytes_input_adapter
+{
+  public:
+    using char_type = typename std::iterator_traits<IteratorType>::value_type;
+
+    contiguous_bytes_input_adapter(IteratorType first, size_t length)
+        : current(std::move(first)), remaining(length) {}
+
+    typename std::char_traits<char_type>::int_type get_character()
+    {
+        if (JSON_HEDLEY_LIKELY(remaining > 0))
+        {
+            auto result = std::char_traits<char_type>::to_int_type(*current);
+            std::advance(current, 1);
+            --remaining;
+            return result;
+        }
+        else
+        {
+            return std::char_traits<char_type>::eof();
+        }
+    }
+
+    template<typename Container>
+    size_t get_data(Container& container, size_t length)
+    {
+        if (JSON_HEDLEY_UNLIKELY(remaining < length))
+        {
+            return remaining;
+        }
+        auto end = current + length;
+        container.assign(current, end);
+        current = end;
+        remaining -= length;
+        return length;
+    }
+
+  private:
+    IteratorType current;
+    size_t remaining;
+};
 
 template<typename BaseInputAdapter, size_t T>
 struct wide_string_input_helper;
@@ -5027,6 +5122,23 @@ class wide_string_input_adapter
         return utf8_bytes[utf8_bytes_index++];
     }
 
+    template<typename Container>
+    size_t get_data(Container& container, size_t length)
+    {
+        container.clear();
+        size_t done;
+        for(done = 0; done < length; ++done)
+        {
+            auto c = get_character();
+            if(c == std::char_traits<char_type>::eof())
+            {
+                break;
+            }
+            container.push_back(c);
+        }
+        return done;
+    }
+
   private:
     BaseInputAdapter base_adapter;
 
@@ -5102,6 +5214,17 @@ auto input_adapter(const ContainerType& container) -> decltype(input_adapter(beg
     return input_adapter(begin(container), end(container));
 }
 
+// Use contiguous_bytes_input_adapter for vector.
+// Should use some contiguous container trait instead to switch between
+// normal iterator based input adapter and contiguous one via template
+// input_adapter(const ContainerType& container).
+// Something like C++20 contiguous_iterator might be useful.
+template<typename T, typename Allocator, typename std::enable_if<sizeof(T) == 1, int>::type = 0>
+contiguous_bytes_input_adapter<const T*> input_adapter(const std::vector<T, Allocator>& container)
+{
+    return contiguous_bytes_input_adapter<const T*>(container.data(), container.size());
+}
+
 // Special cases with fast paths
 inline file_input_adapter input_adapter(std::FILE* file)
 {
@@ -5118,8 +5241,6 @@ inline input_stream_adapter input_adapter(std::istream&& stream)
     return input_stream_adapter(stream);
 }
 
-using contiguous_bytes_input_adapter = decltype(input_adapter(std::declval<const char*>(), std::declval<const char*>()));
-
 // Null-delimited strings, and the like.
 template < typename CharT,
            typename std::enable_if <
@@ -5128,17 +5249,17 @@ template < typename CharT,
                std::is_integral<typename std::remove_pointer<CharT>::type>::value&&
                sizeof(typename std::remove_pointer<CharT>::type) == 1,
                int >::type = 0 >
-contiguous_bytes_input_adapter input_adapter(CharT b)
+contiguous_bytes_input_adapter<const char*> input_adapter(CharT b)
 {
     auto length = std::strlen(reinterpret_cast<const char*>(b));
     const auto* ptr = reinterpret_cast<const char*>(b);
-    return input_adapter(ptr, ptr + length);
+    return contiguous_bytes_input_adapter<const char*>(ptr, length);
 }
 
 template<typename T, std::size_t N>
-auto input_adapter(T (&array)[N]) -> decltype(input_adapter(array, array + N))
+contiguous_bytes_input_adapter<const T*> input_adapter(T (&array)[N])
 {
-    return input_adapter(array, array + N);
+    return contiguous_bytes_input_adapter<const T*>(array, N);
 }
 
 // This class only handles inputs of input_buffer_adapter type.
@@ -5154,7 +5275,7 @@ class span_input_adapter
                    sizeof(typename std::remove_pointer<CharT>::type) == 1,
                    int >::type = 0 >
     span_input_adapter(CharT b, std::size_t l)
-        : ia(reinterpret_cast<const char*>(b), reinterpret_cast<const char*>(b) + l) {}
+        : ia(reinterpret_cast<const char*>(b), l) {}
 
     template<class IteratorType,
              typename std::enable_if<
@@ -5163,13 +5284,13 @@ class span_input_adapter
     span_input_adapter(IteratorType first, IteratorType last)
         : ia(input_adapter(first, last)) {}
 
-    contiguous_bytes_input_adapter&& get()
+    contiguous_bytes_input_adapter<const char*>&& get()
     {
         return std::move(ia);
     }
 
   private:
-    contiguous_bytes_input_adapter ia;
+    contiguous_bytes_input_adapter<const char*> ia;
 };
 }  // namespace detail
 }  // namespace nlohmann
@@ -9894,6 +10015,31 @@ class binary_reader
     }
 
     /*!
+    @brief get next bytes from the input
+
+    This function provides the interface to the used input adapter. It does
+    not throw in case the input reached EOF, but returns false in that case.
+
+    @param[in] container container to store the bytes
+    @param[in] length    number of bytes to get
+
+    @return bytes read, less than length if EOF is reached
+    */
+    template<typename Container>
+    size_t get(Container& container, size_t length)
+    {
+        size_t read = ia.get_data(container, length);
+        chars_read += read;
+        if(read < length)
+        {
+            // mimic behavior of single char get
+            ++chars_read;
+            current = std::char_traits<char_type>::eof();
+        }
+        return read;
+    }
+
+    /*!
     @return character read from the input after ignoring all 'N' entries
     */
     char_int_type get_ignore_noop()
@@ -9952,7 +10098,6 @@ class binary_reader
     /*!
     @brief create a string by reading characters from the input
 
-    @tparam NumberType the type of the number
     @param[in] format the current format (for diagnostics)
     @param[in] len number of characters to read
     @param[out] result string created by reading @a len bytes
@@ -9963,13 +10108,12 @@ class binary_reader
           may be too large. Usually, @ref unexpect_eof() detects the end of
           the input before we run out of string memory.
     */
-    template<typename NumberType>
     bool get_string(const input_format_t format,
-                    const NumberType len,
+                    const size_t len,
                     string_t& result)
     {
         bool success = true;
-        for (NumberType i = 0; i < len; i++)
+        for (size_t i = 0; i < len; i++)
         {
             get();
             if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "string")))
@@ -9985,7 +10129,6 @@ class binary_reader
     /*!
     @brief create a byte array by reading bytes from the input
 
-    @tparam NumberType the type of the number
     @param[in] format the current format (for diagnostics)
     @param[in] len number of bytes to read
     @param[out] result byte array created by reading @a len bytes
@@ -9996,23 +10139,16 @@ class binary_reader
           may be too large. Usually, @ref unexpect_eof() detects the end of
           the input before we run out of memory.
     */
-    template<typename NumberType>
     bool get_binary(const input_format_t format,
-                    const NumberType len,
+                    const size_t len,
                     binary_t& result)
     {
-        bool success = true;
-        for (NumberType i = 0; i < len; i++)
+        get(result, len);
+        if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "binary")))
         {
-            get();
-            if (JSON_HEDLEY_UNLIKELY(!unexpect_eof(format, "binary")))
-            {
-                success = false;
-                break;
-            }
-            result.push_back(static_cast<std::uint8_t>(current));
+            return false;
         }
-        return success;
+        return true;
     }
 
     /*!
@@ -12657,7 +12793,7 @@ class output_vector_adapter : public output_adapter_protocol<CharType>
     JSON_HEDLEY_NON_NULL(2)
     void write_characters(const CharType* s, std::size_t length) override
     {
-        std::copy(s, s + length, std::back_inserter(v));
+        v.insert(v.end(), s, s + length);
     }
 
   private:
@@ -16686,7 +16822,7 @@ class basic_json
         detail::parser_callback_t<basic_json>cb = nullptr,
         const bool allow_exceptions = true,
         const bool ignore_comments = false
-                                 )
+    )
     {
         return ::nlohmann::detail::parser<basic_json, InputAdapterType>(std::move(adapter),
                 std::move(cb), allow_exceptions, ignore_comments);
@@ -25227,7 +25363,7 @@ template<>
 inline void swap<nlohmann::json>(nlohmann::json& j1, nlohmann::json& j2) noexcept(
     is_nothrow_move_constructible<nlohmann::json>::value&&
     is_nothrow_move_assignable<nlohmann::json>::value
-                              )
+)
 {
     j1.swap(j2);
 }
